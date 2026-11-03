@@ -1,0 +1,9 @@
+obj-m := fastswap_dram.o fastswap_rdma.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+default:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
