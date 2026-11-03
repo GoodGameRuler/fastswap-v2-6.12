@@ -16,7 +16,7 @@ Results on soft-RoCE (32M cgroup, UDP netdev): DRAM `touch 64 1` 0.22 s. RDMA `t
    `strip --strip-debug /work/build/share/v612/*.ko`
 5. Build the far memory server as in "Build the Far Memory Server" (`../fastswap-v2-proposal/README.md`).
 
-### Stage the rdma Tool
+### Copy the rdma Tool
 
 The 6.12 guest has soft-RoCE built in but no `rdma` command.
 
