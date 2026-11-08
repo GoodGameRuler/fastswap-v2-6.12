@@ -1,16 +1,21 @@
 diff --git a/include/linux/fastswap.h b/include/linux/fastswap.h
 new file mode 100644
-index 000000000000..739f336fdf2c
+index 000000000000..75b0d0eb7af3
 --- /dev/null
 +++ b/include/linux/fastswap.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,38 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_FASTSWAP_H
 +#define _LINUX_FASTSWAP_H
 +
 +#include <linux/swap.h>
 +
++/*
++ * The folio passed to store and the load callbacks may be large. A callback transfers
++ * folio_size() bytes at the slot of index, and loads complete the whole folio.
++ */
 +struct fastswap_ops {
++	struct module *owner;
 +	int (*store)(unsigned type, pgoff_t index, struct folio *folio);
 +	int (*load)(unsigned type, pgoff_t index, struct folio *folio);
 +	int (*load_async)(unsigned type, pgoff_t index, struct folio *folio);
@@ -20,15 +25,18 @@ index 000000000000..739f336fdf2c
 +#ifdef CONFIG_FASTSWAP
 +#define FASTSWAP_MAP_LONGS(pages)	BITS_TO_LONGS(pages)
 +int fastswap_register_ops(const struct fastswap_ops *ops);
++void fastswap_unregister_ops(const struct fastswap_ops *ops);
 +bool fastswap_store(struct folio *folio);
 +bool fastswap_load(struct folio *folio, bool sync);
 +void fastswap_poll_load(int cpu);
++int fastswap_batch(swp_entry_t entry, int max_nr);
 +void fastswap_clear(struct swap_info_struct *si, pgoff_t offset, unsigned int nr);
 +#else
 +#define FASTSWAP_MAP_LONGS(pages)	0
 +static inline bool fastswap_store(struct folio *folio) { return false; }
 +static inline bool fastswap_load(struct folio *folio, bool sync) { return false; }
 +static inline void fastswap_poll_load(int cpu) { }
++static inline int fastswap_batch(swp_entry_t entry, int max_nr) { return max_nr; }
 +static inline void fastswap_clear(struct swap_info_struct *si, pgoff_t offset,
 +				  unsigned int nr) { }
 +#endif
@@ -66,20 +74,22 @@ index d5639b036166..3036364b468f 100644
  obj-$(CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP)	+= hugetlb_vmemmap.o
 diff --git a/mm/fastswap.c b/mm/fastswap.c
 new file mode 100644
-index 000000000000..0a1c0a80eddc
+index 000000000000..8910bb707a23
 --- /dev/null
 +++ b/mm/fastswap.c
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,230 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* Far-memory swap hook: stores and loads swap slots through a backend module. */
 +#include <linux/fastswap.h>
 +#include <linux/debugfs.h>
 +#include <linux/module.h>
++#include <linux/srcu.h>
 +#include <linux/swapops.h>
 +
 +static const struct fastswap_ops *fastswap_backend;
-+static u64 loads, succ_stores, failed_stores, invalidates;
++static u64 loads, succ_stores, failed_stores, invalidates, large_stores;
 +static atomic_t curr_pages;
++DEFINE_STATIC_SRCU(fastswap_srcu);
 +
 +/* The far-memory bitmap follows the zeromap in the same allocation. */
 +static unsigned long *far_map(struct swap_info_struct *si)
@@ -87,48 +97,171 @@ index 000000000000..0a1c0a80eddc
 +	return si->zeromap + BITS_TO_LONGS(si->max);
 +}
 +
++/*
++ * Every slot with its far bit set holds one reference on the backend module, so rmmod fails with
++ * EBUSY while far memory holds pages. The SRCU read side covers a call into the backend, which can
++ * sleep; unregister waits for it before the module text goes away.
++ */
 +int fastswap_register_ops(const struct fastswap_ops *new_ops)
 +{
-+	if (READ_ONCE(fastswap_backend)) {
++	if (cmpxchg(&fastswap_backend, NULL, new_ops)) {
 +		return -EBUSY;
 +	}
 +
-+	smp_store_release(&fastswap_backend, new_ops);
 +	return 0;
 +}
 +EXPORT_SYMBOL_GPL(fastswap_register_ops);
 +
-+void fastswap_clear(struct swap_info_struct *si, pgoff_t offset, unsigned int nr)
++/* Only called from the backend's module_exit, so no far page can remain. */
++void fastswap_unregister_ops(const struct fastswap_ops *old_ops)
++{
++	WARN_ON_ONCE(atomic_read(&curr_pages));
++
++	if (cmpxchg(&fastswap_backend, old_ops, NULL) == old_ops) {
++		synchronize_srcu(&fastswap_srcu);
++	}
++}
++EXPORT_SYMBOL_GPL(fastswap_unregister_ops);
++
++/* Clears the far bits of a slot range and drops each bit's module reference. */
++static void clear_far_range(struct swap_info_struct *si, pgoff_t offset, unsigned int nr,
++			    bool is_invalidate)
 +{
 +	unsigned int i;
 +
 +	for (i = 0; i < nr; i++) {
 +		if (test_and_clear_bit(offset + i, far_map(si))) {
++			/* The bit's module reference keeps the backend registered until the put. */
++			struct module *owner = READ_ONCE(fastswap_backend)->owner;
++
 +			atomic_dec(&curr_pages);
-+			data_race(invalidates++);
++			if (is_invalidate) {
++				data_race(invalidates++);
++			}
++			module_put(owner);
 +		}
 +	}
 +}
 +
-+bool fastswap_store(struct folio *folio)
++void fastswap_clear(struct swap_info_struct *si, pgoff_t offset, unsigned int nr)
++{
++	clear_far_range(si, offset, nr, true);
++}
++
++/* Number of slots in [offset, offset + nr) with the far bit set. */
++static unsigned int count_far_bits(struct swap_info_struct *si, pgoff_t offset, unsigned int nr)
++{
++	unsigned int i, far_count = 0;
++
++	for (i = 0; i < nr; i++) {
++		if (test_bit(offset + i, far_map(si))) {
++			far_count++;
++		}
++	}
++
++	return far_count;
++}
++
++/*
++ * Length of the leading run of slots that share the far state of the first slot, like
++ * swap_zeromap_batch(). A large swap-in must not mix far and disk slots.
++ */
++int fastswap_batch(swp_entry_t entry, int max_nr)
++{
++	struct swap_info_struct *si = swp_swap_info(entry);
++	pgoff_t offset = swp_offset(entry);
++	bool is_far = test_bit(offset, far_map(si));
++	int i;
++
++	for (i = 1; i < max_nr; i++) {
++		if (test_bit(offset + i, far_map(si)) != is_far) {
++			return i;
++		}
++	}
++
++	return max_nr;
++}
++
++/*
++ * One backend store covers the whole folio; its slots are an aligned contiguous run. The far
++ * bits are set only after the store succeeded, one module reference per bit. If a reference
++ * cannot be taken, every bit set so far is undone and the folio goes to the swap device. The
++ * remote copy is stale but unreferenced.
++ */
++static bool store_far(const struct fastswap_ops *ops, struct folio *folio)
 +{
 +	struct swap_info_struct *si = swp_swap_info(folio->swap);
 +	pgoff_t offset = swp_offset(folio->swap);
-+	const struct fastswap_ops *ops = READ_ONCE(fastswap_backend);
-+
-+	if (!ops || folio_test_large(folio)) {
-+		return false;
-+	}
++	unsigned int nr = folio_nr_pages(folio);
++	unsigned int i;
 +
 +	if (ops->store(si->type, offset, folio)) {
 +		data_race(failed_stores++);
 +		return false;
 +	}
 +
-+	if (!test_and_set_bit(offset, far_map(si))) {
-+		atomic_inc(&curr_pages);
++	for (i = 0; i < nr; i++) {
++		/* Fails once rmmod has committed; the swap device then takes the folio. */
++		if (!try_module_get(ops->owner)) {
++			clear_far_range(si, offset, i, false);
++			return false;
++		}
++
++		if (test_and_set_bit(offset + i, far_map(si))) {
++			module_put(ops->owner);
++		} else {
++			atomic_inc(&curr_pages);
++		}
 +	}
-+	data_race(succ_stores++);
++
++	data_race(succ_stores += nr);
++	if (nr > 1) {
++		data_race(large_stores++);
++	}
++
++	return true;
++}
++
++bool fastswap_store(struct folio *folio)
++{
++	const struct fastswap_ops *ops;
++	bool is_stored = false;
++	int idx = srcu_read_lock(&fastswap_srcu);
++
++	ops = srcu_dereference(fastswap_backend, &fastswap_srcu);
++	if (ops) {
++		is_stored = store_far(ops, folio);
++	}
++	srcu_read_unlock(&fastswap_srcu, idx);
++
++	return is_stored;
++}
++
++/*
++ * A large folio is loaded only if all its slots are far. With none far the swap device reads
++ * it. A mixed run must never go to the device, whose data is stale for the far slots, so the
++ * folio is completed as failed (unlocked, not uptodate) and the fault gets SIGBUS.
++ * can_swapin_thp() keeps mixed runs from being allocated as one folio.
++ */
++static bool load_far(const struct fastswap_ops *ops, struct folio *folio, bool sync)
++{
++	struct swap_info_struct *si = swp_swap_info(folio->swap);
++	pgoff_t offset = swp_offset(folio->swap);
++	unsigned int nr = folio_nr_pages(folio);
++	unsigned int far_count = count_far_bits(si, offset, nr);
++
++	if (!far_count) {
++		return false;
++	}
++
++	if (far_count != nr) {
++		WARN_ON_ONCE(1);
++		folio_unlock(folio);
++		return true;
++	}
++
++	data_race(loads += nr);
++	(sync ? ops->load : ops->load_async)(si->type, offset, folio);
 +
 +	return true;
 +}
@@ -136,38 +269,29 @@ index 000000000000..0a1c0a80eddc
 +/* True if the slot is in far memory and the backend now owns the folio. */
 +bool fastswap_load(struct folio *folio, bool sync)
 +{
-+	struct swap_info_struct *si = swp_swap_info(folio->swap);
-+	pgoff_t offset = swp_offset(folio->swap);
-+	unsigned int nr = folio_nr_pages(folio);
-+	const struct fastswap_ops *ops = READ_ONCE(fastswap_backend);
++	const struct fastswap_ops *ops;
++	bool is_far = false;
++	int idx = srcu_read_lock(&fastswap_srcu);
 +
-+	if (!ops) {
-+		return false;
++	ops = srcu_dereference(fastswap_backend, &fastswap_srcu);
++	if (ops) {
++		is_far = load_far(ops, folio, sync);
 +	}
++	srcu_read_unlock(&fastswap_srcu, idx);
 +
-+	/* Large folios are never stored; THP swapin is not gated as THP is off. */
-+	if (nr > 1) {
-+		WARN_ON_ONCE(find_next_bit(far_map(si), offset + nr, offset) < offset + nr);
-+		return false;
-+	}
-+
-+	if (!test_bit(offset, far_map(si))) {
-+		return false;
-+	}
-+
-+	data_race(loads++);
-+	(sync ? ops->load : ops->load_async)(si->type, offset, folio);
-+
-+	return true;
++	return is_far;
 +}
 +
 +void fastswap_poll_load(int cpu)
 +{
-+	const struct fastswap_ops *ops = READ_ONCE(fastswap_backend);
++	const struct fastswap_ops *ops;
++	int idx = srcu_read_lock(&fastswap_srcu);
 +
++	ops = srcu_dereference(fastswap_backend, &fastswap_srcu);
 +	if (ops) {
 +		ops->poll_load(cpu);
 +	}
++	srcu_read_unlock(&fastswap_srcu, idx);
 +}
 +
 +static int __init fastswap_debugfs_init(void)
@@ -177,6 +301,7 @@ index 000000000000..0a1c0a80eddc
 +	debugfs_create_u64("loads", 0444, root, &loads);
 +	debugfs_create_u64("succ_stores", 0444, root, &succ_stores);
 +	debugfs_create_u64("failed_stores", 0444, root, &failed_stores);
++	debugfs_create_u64("large_stores", 0444, root, &large_stores);
 +	debugfs_create_u64("invalidates", 0444, root, &invalidates);
 +	debugfs_create_atomic_t("curr_pages", 0444, root, &curr_pages);
 +
@@ -262,6 +387,28 @@ index 53db98d2c4a1..4c4f17dfacf9 100644
  				break;
  			}
  			continue;
+diff --git a/mm/memory.c b/mm/memory.c
+index bdf77a3ec47b..10bc5cc54f6b 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -50,6 +50,7 @@
+ #include <linux/hugetlb.h>
+ #include <linux/mman.h>
+ #include <linux/swap.h>
++#include <linux/fastswap.h>
+ #include <linux/highmem.h>
+ #include <linux/pagemap.h>
+ #include <linux/memremap.h>
+@@ -4076,6 +4077,9 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
+ 		return false;
+ 	if (unlikely(non_swapcache_batch(entry, nr_pages) != nr_pages))
+ 		return false;
++	/* Far memory and the swap device must not be mixed within one folio either. */
++	if (unlikely(fastswap_batch(entry, nr_pages) != nr_pages))
++		return false;
+ 
+ 	return true;
+ }
 diff --git a/mm/page_io.c b/mm/page_io.c
 index 01749b99fb54..e4274b16396c 100644
 --- a/mm/page_io.c

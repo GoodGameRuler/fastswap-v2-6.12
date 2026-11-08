@@ -140,7 +140,7 @@ cat /sys/kernel/debug/frontswap/{succ_stores,loads,invalidates,failed_stores,cur
 | `failed_stores` | Writes that failed and went to the swap device instead |
 | `curr_pages` | Pages in far memory now |
 
-Reboot the client with a fresh overlay before each variant below, because a backend cannot be reloaded within one boot. Restart `rmserver` on the server each time.
+Before each variant below, remove the module as in Remove the Module, or reboot the client with a fresh overlay. Restart `rmserver` on the server each time.
 
 #### Longer Run
 
@@ -229,6 +229,17 @@ After a run:
 swapoff /dev/vdb; swapon /dev/vdb
 ```
 
+### Remove the Module
+
+`rmmod` fails with `Device or resource busy` while any page is in far memory. Run `swapoff` first, then remove the module:
+
+```bash
+swapoff /dev/vdb
+rmmod fastswap_rdma
+```
+
+The server log (`/tmp/rm.log`) shows one disconnect per queue. Restart `rmserver` before loading the module again.
+
 ### DRAM Backend
 
 Skip the server VM and the `rdma link add` and `ping` steps. Load the DRAM backend in place of the RDMA backend:
@@ -237,9 +248,33 @@ Skip the server VM and the `rdma link add` and `ping` steps. Load the DRAM backe
 insmod /mnt/host/v612/fastswap_dram.ko size_mb=256
 ```
 
-`rmmod fastswap_dram` prints `Device or resource busy`.
+`rmmod fastswap_dram` prints `Device or resource busy` while pages are in far memory. After `swapoff` it succeeds.
+
+### Large Folios
+
+Build the kernel with `scripts/6.12/config-thp.fragment` merged after `config.fragment` (`../docs/fastswap_build_steps-6.12.md`, "Enable Transparent Huge Pages") in the build directory `6.12-fastswap-lf`, and build the modules with `KDIR=/work/build/6.12-fastswap-lf`.
+
+Set up the swap device and the folio sizes before `swapon`.
+
+```bash
+echo 0 > /sys/block/vdb/queue/rotational
+mkswap /dev/vdb; swapon /dev/vdb
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+echo madvise > /sys/kernel/mm/transparent_hugepage/hugepages-64kB/enabled
+```
+
+Never enable `hugepages-2048kB` with the RDMA backend. The DRAM backend needs `size_mb=256` in a 1 GB guest.
+
+`touch_thp <MiB> [passes]` (`workload/touch_thp.c`) is `touch` with a 64 KiB aligned region and `MADV_HUGEPAGE`.
+
+```bash
+echo $$ > /cgroup2/test/cgroup.procs
+/mnt/host/touch_thp 64 1
+```
+
+It prints the swap counters and the 64 KiB mTHP stats after each phase. `large_stores` in `/sys/kernel/debug/frontswap` counts the large folios written to far memory.
 
 ### Notes
 
-- Load one backend per boot. No rmmod currently.
+- One backend at a time. `rmmod` is refused while pages are in far memory: run `swapoff` first.
 - The test kernel has no lockdep or `DEBUG_PREEMPT`: the splat greps cover less than on a debug kernel.

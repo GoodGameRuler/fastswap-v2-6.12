@@ -16,25 +16,33 @@ static void *far_memory;
 static int dram_store(unsigned type, pgoff_t index, struct folio *folio)
 {
     u64 offset = fastswap_offset(index);
-    void *src;
+    long page_index;
 
-    if (folio_test_large(folio) || offset + PAGE_SIZE > size_mb << 20) {
+    if (offset + folio_size(folio) > size_mb << 20) {
         return -ENOSPC;
     }
 
-    src = kmap_local_folio(folio, 0);
-    copy_page(far_memory + offset, src);
-    kunmap_local(src);
+    for (page_index = 0; page_index < folio_nr_pages(folio); page_index++) {
+        void *src = kmap_local_folio(folio, page_index * PAGE_SIZE);
+
+        copy_page(far_memory + offset + page_index * PAGE_SIZE, src);
+        kunmap_local(src);
+    }
 
     return 0;
 }
 
 static int dram_load(unsigned type, pgoff_t index, struct folio *folio)
 {
-    void *dst = kmap_local_folio(folio, 0);
+    u64 offset = fastswap_offset(index);
+    long page_index;
 
-    copy_page(dst, far_memory + fastswap_offset(index));
-    kunmap_local(dst);
+    for (page_index = 0; page_index < folio_nr_pages(folio); page_index++) {
+        void *dst = kmap_local_folio(folio, page_index * PAGE_SIZE);
+
+        copy_page(dst, far_memory + offset + page_index * PAGE_SIZE);
+        kunmap_local(dst);
+    }
 
     folio_mark_uptodate(folio);
     folio_unlock(folio);
@@ -48,6 +56,7 @@ static int dram_poll_load(int cpu)
 }
 
 static struct fastswap_ops dram_ops = {
+    .owner = THIS_MODULE,
     .store = dram_store,
     .load = dram_load,
     .load_async = dram_load,
@@ -56,14 +65,28 @@ static struct fastswap_ops dram_ops = {
 
 static int __init dram_init(void)
 {
+    int ret;
+
     far_memory = vzalloc(size_mb << 20);
     if (!far_memory) {
         return -ENOMEM;
     }
 
-    return fastswap_register_ops(&dram_ops);
+    ret = fastswap_register_ops(&dram_ops);
+    if (ret) {
+        vfree(far_memory);
+    }
+
+    return ret;
+}
+
+static void __exit dram_exit(void)
+{
+    fastswap_unregister_ops(&dram_ops);
+    vfree(far_memory);
 }
 
 module_init(dram_init);
+module_exit(dram_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("FastSwap DRAM backend");

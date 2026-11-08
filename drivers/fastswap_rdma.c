@@ -61,6 +61,7 @@ module_param(queues, int, 0444);
 static struct ib_pd *protection_domain;
 static struct fastswap_queue *all_queues;
 static struct remote_region server_region;
+static bool is_closing;
 static struct sockaddr_storage server_addr, client_addr;
 
 /* CPU may change before the request is posted; the queue is only a hint */
@@ -73,15 +74,17 @@ static int create_queue_resources(struct fastswap_queue *queue)
 {
     struct ib_device *device = queue->connection->device;
     struct ib_qp_init_attr qp_attributes = {
-        .cap.max_send_wr = QUEUE_DEPTH,
+        .cap.max_send_wr = QUEUE_DEPTH, /* send request buffer size */
         .cap.max_recv_wr = 1,
-        .cap.max_send_sge = 1,
+        .cap.max_send_sge = 1, /* one request may reference upto "1"
+                                  (local IO-VA address, length, lkey) tuple */
         .cap.max_recv_sge = 1,
-        .sq_sig_type = IB_SIGNAL_REQ_WR,
-        .qp_type = IB_QPT_RC,
+        .sq_sig_type = IB_SIGNAL_REQ_WR, /* only tagged send requests produce completion events */
+        .qp_type = IB_QPT_RC, /* reliable conenction */
     };
     int ret;
 
+    /* We treat the remote memory as one big pool. Hence we only allocate one PD */
     if (!protection_domain) {
         protection_domain = ib_alloc_pd(device, 0);
         if (IS_ERR(protection_domain)) {
@@ -114,7 +117,7 @@ static int create_queue_resources(struct fastswap_queue *queue)
 static int connection_event_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event)
 {
     struct fastswap_queue *queue = cm_id->context;
-    struct rdma_conn_param connect_params = {
+    static struct rdma_conn_param connect_params = {
         .flow_control = 1,
         .responder_resources = 16,
         .initiator_depth = 16,
@@ -128,6 +131,8 @@ static int connection_event_handler(struct rdma_cm_id *cm_id, struct rdma_cm_eve
             err = create_queue_resources(queue) ?: rdma_resolve_route(cm_id, CONNECT_TIMEOUT_MS);
             break;
         case RDMA_CM_EVENT_ROUTE_RESOLVED:
+            /* CM Handler has already acquired handler_mutex, so must call (already) locked variant
+             * rdma_conenct would attempt to acquire lock */
             err = rdma_connect_locked(cm_id, &connect_params);
             break;
         case RDMA_CM_EVENT_ESTABLISHED:
@@ -138,6 +143,10 @@ static int connection_event_handler(struct rdma_cm_id *cm_id, struct rdma_cm_eve
             }
             break;
         default:
+            if (READ_ONCE(is_closing)) {
+                return 0;
+            }
+
             pr_err("cm event %s (%d)\n", rdma_event_msg(event->event), event->status);
             queue->is_failed = true;
             err = -ECONNRESET;
@@ -155,11 +164,12 @@ static int connect_queue(struct fastswap_queue *queue, enum ib_poll_context poll
 {
     queue->poll_mode = poll_mode;
     queue->connect_error = -ETIMEDOUT;
+
     spin_lock_init(&queue->completion_queue_lock);
     init_completion(&queue->connect_completion);
 
     queue->connection = rdma_create_id(&init_net, connection_event_handler, queue,
-            RDMA_PS_TCP, IB_QPT_RC);
+            RDMA_PS_TCP /* TCP like Port Space */, IB_QPT_RC);
     if (IS_ERR(queue->connection)) {
         return PTR_ERR(queue->connection);
     }
@@ -169,6 +179,7 @@ static int connect_queue(struct fastswap_queue *queue, enum ib_poll_context poll
         return -ENODEV;
     }
 
+    /* connection_event_handler is called on establishing connection. Wait for completion.  */
     wait_for_completion_timeout(&queue->connect_completion, msecs_to_jiffies(CONNECT_TIMEOUT_MS) + 1);
 
     return queue->connect_error;
@@ -177,6 +188,8 @@ static int connect_queue(struct fastswap_queue *queue, enum ib_poll_context poll
 static void close_queues(void)
 {
     int i;
+
+    WRITE_ONCE(is_closing, true);
 
     for (i = 0; all_queues && i < QP_TYPES * queues; i++) {
         struct fastswap_queue *queue = &all_queues[i];
@@ -247,7 +260,8 @@ static void complete_folio(struct folio *folio, bool is_uptodate)
 static void release_request(struct fastswap_queue *queue, struct fastswap_request *request,
         enum dma_data_direction direction)
 {
-    ib_dma_unmap_page(queue->connection->device, request->local_mapped_addr, PAGE_SIZE, direction);
+    ib_dma_unmap_page(queue->connection->device, request->local_mapped_addr,
+            folio_size(request->folio), direction);
     clear_bit(request - queue->requests, queue->used_request_map);
     atomic_dec(&queue->requests_in_flight);
 }
@@ -291,13 +305,14 @@ static int post_page(struct fastswap_queue *queue, struct folio *folio, u64 remo
     const struct ib_send_wr *failed_work_request;
     struct ib_sge local_segment;
     struct ib_rdma_wr work_request = {};
+    size_t size = folio_size(folio);
     int request_index, ret;
 
     if (queue->is_failed) {
         return -EIO;
     }
 
-    if (remote_offset + PAGE_SIZE > server_region.size) {
+    if (remote_offset + size > server_region.size) {
         return -ENOSPC;
     }
 
@@ -311,7 +326,7 @@ static int post_page(struct fastswap_queue *queue, struct folio *folio, u64 remo
     request = &queue->requests[request_index];
     request->folio = folio;
     request->completion_callback.done = opcode == IB_WR_RDMA_WRITE ? write_done : read_done;
-    request->local_mapped_addr = ib_dma_map_page(device, folio_page(folio, 0), 0, PAGE_SIZE,
+    request->local_mapped_addr = ib_dma_map_page(device, folio_page(folio, 0), 0, size,
             direction);
 
     if (ib_dma_mapping_error(device, request->local_mapped_addr)) {
@@ -320,7 +335,7 @@ static int post_page(struct fastswap_queue *queue, struct folio *folio, u64 remo
     }
 
     local_segment.addr = request->local_mapped_addr;
-    local_segment.length = PAGE_SIZE;
+    local_segment.length = size;
     local_segment.lkey = protection_domain->local_dma_lkey;
     work_request.wr.wr_cqe = &request->completion_callback;
     work_request.wr.sg_list = &local_segment;
@@ -344,10 +359,6 @@ static int post_page(struct fastswap_queue *queue, struct folio *folio, u64 remo
 static int rdma_store(unsigned swap_type, pgoff_t swap_offset, struct folio *folio)
 {
     struct fastswap_queue *queue = queue_for_cpu(raw_smp_processor_id(), QP_WRITE);
-
-    if (folio_test_large(folio)) {
-        return -EINVAL;
-    }
 
     return post_page(queue, folio, fastswap_offset(swap_offset), IB_WR_RDMA_WRITE) ?:
         wait_in_flight(queue) ?: (queue->is_failed ? -EIO : 0);
@@ -382,6 +393,7 @@ static int rdma_poll_load(int cpu)
 }
 
 static struct fastswap_ops rdma_ops = {
+    .owner = THIS_MODULE,
     .store = rdma_store,
     .load = rdma_load,
     .load_async = rdma_load_async,
@@ -398,7 +410,8 @@ static int __init fastswap_rdma_init(void)
         queues = num_online_cpus();
     }
 
-    /* IPv4 only. Could be changed. */
+    /* IPv4 only. Could be changed. 
+     * init_net is the default sys namespace */
     ret = inet_pton_with_scope(&init_net, AF_INET, server_ip, server_port, &server_addr);
     if (!ret && client_ip[0]) {
         ret = inet_pton_with_scope(&init_net, AF_INET, client_ip, NULL, &client_addr);
@@ -437,13 +450,21 @@ static int __init fastswap_rdma_init(void)
     return ret;
 }
 
-static int __exit fastswap_rdma_exit(void) {
+/* rmmod only gets here with no far page left, so no read is in flight */
+static void __exit fastswap_rdma_exit(void)
+{
+    int i;
 
-    /* TODO: Handle Cleanup */ 
+    fastswap_unregister_ops(&rdma_ops);
 
-    return 0;
+    for (i = 0; i < QP_TYPES * queues; i++) {
+        wait_in_flight(&all_queues[i]);
+    }
+
+    close_queues();
 }
 
 module_init(fastswap_rdma_init);
+module_exit(fastswap_rdma_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("FastSwap RDMA backend");
